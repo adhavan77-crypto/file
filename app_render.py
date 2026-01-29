@@ -1,231 +1,242 @@
-from fastapi import FastAPI, HTTPException, Header, Request
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 import base64
-import io
-import numpy as np
 import os
-from typing import Optional
-import uvicorn
+import tempfile
+import librosa
+import numpy as np
+from scipy import stats
+import traceback
 
-# Initialize FastAPI
-app = FastAPI(
-    title="AI Voice Detection API",
-    description="Detects AI-generated vs Human voice in multiple languages",
-    version="1.0.0"
-)
+app = Flask(__name__)
+CORS(app)
 
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# API Key for authentication
+API_KEY = os.environ.get('API_KEY', 'your-secure-api-key-12345')
 
-# API Key
-API_KEY = os.getenv("API_KEY", "your-secure-api-key-12345")
-
-# Models
-class VoiceDetectionRequest(BaseModel):
-    audio_base64: str
-    language: Optional[str] = "english"
-
-class VoiceDetectionResponse(BaseModel):
-    classification: str
-    confidence: float
-    language: str
-    explanation: str
-
-def extract_audio_features(audio_data, sr):
-    """Extract audio features using numpy only (avoiding librosa issues)"""
+def extract_features(audio_path):
+    """Extract audio features for classification"""
     try:
-        # Import librosa here to avoid deployment issues
-        import librosa
+        # Load audio file with shorter duration for faster processing
+        y, sr = librosa.load(audio_path, sr=22050, duration=10)
         
-        # Basic features
-        spectral_centroids = librosa.feature.spectral_centroid(y=audio_data, sr=sr)[0]
-        spectral_rolloff = librosa.feature.spectral_rolloff(y=audio_data, sr=sr)[0]
-        zcr = librosa.feature.zero_crossing_rate(audio_data)[0]
-        mfccs = librosa.feature.mfcc(y=audio_data, sr=sr, n_mfcc=13)
-        rms = librosa.feature.rms(y=audio_data)[0]
+        features = {}
         
-        features = {
-            'spectral_centroid_mean': float(np.mean(spectral_centroids)),
-            'spectral_centroid_std': float(np.std(spectral_centroids)),
-            'spectral_rolloff_mean': float(np.mean(spectral_rolloff)),
-            'zcr_mean': float(np.mean(zcr)),
-            'zcr_std': float(np.std(zcr)),
-            'mfcc_mean': float(np.mean(mfccs)),
-            'mfcc_std': float(np.std(mfccs)),
-            'rms_mean': float(np.mean(rms)),
-            'rms_std': float(np.std(rms)),
-        }
+        # 1. Spectral features
+        spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
+        features['spectral_centroid_mean'] = np.mean(spectral_centroids)
+        features['spectral_centroid_std'] = np.std(spectral_centroids)
+        
+        spectral_rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)[0]
+        features['spectral_rolloff_mean'] = np.mean(spectral_rolloff)
+        features['spectral_rolloff_std'] = np.std(spectral_rolloff)
+        
+        # 2. Zero crossing rate
+        zcr = librosa.feature.zero_crossing_rate(y)[0]
+        features['zcr_mean'] = np.mean(zcr)
+        features['zcr_std'] = np.std(zcr)
+        
+        # 3. MFCC features (reduced from 13 to 5 for speed)
+        mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=5)
+        for i in range(5):
+            features[f'mfcc_{i}_mean'] = np.mean(mfccs[i])
+            features[f'mfcc_{i}_std'] = np.std(mfccs[i])
+        
+        # 4. RMS Energy
+        rms = librosa.feature.rms(y=y)[0]
+        features['rms_mean'] = np.mean(rms)
+        features['rms_std'] = np.std(rms)
         
         return features
+    
     except Exception as e:
-        # Fallback to simple analysis if librosa fails
-        return {
-            'spectral_centroid_mean': float(np.mean(np.abs(audio_data))),
-            'spectral_centroid_std': float(np.std(audio_data)),
-            'spectral_rolloff_mean': float(np.max(np.abs(audio_data))),
-            'zcr_mean': 0.5,
-            'zcr_std': 0.1,
-            'mfcc_mean': 0.0,
-            'mfcc_std': 1.0,
-            'rms_mean': float(np.sqrt(np.mean(audio_data**2))),
-            'rms_std': float(np.std(audio_data)),
-        }
-
-def detect_ai_voice(features):
-    """AI voice detection logic"""
-    ai_score = 0
-    
-    # Check consistency patterns
-    spectral_cv = features['spectral_centroid_std'] / (features['spectral_centroid_mean'] + 1e-6)
-    if spectral_cv < 0.15:
-        ai_score += 0.3
-    
-    zcr_cv = features['zcr_std'] / (features['zcr_mean'] + 1e-6)
-    if zcr_cv < 0.4:
-        ai_score += 0.25
-    
-    rms_cv = features['rms_std'] / (features['rms_mean'] + 1e-6)
-    if rms_cv < 0.3:
-        ai_score += 0.25
-    
-    mfcc_variance = features['mfcc_std']
-    if mfcc_variance < 1.5:
-        ai_score += 0.2
-    
-    # Classification
-    if ai_score > 0.5:
-        classification = "AI_GENERATED"
-        confidence = min(0.95, 0.5 + ai_score * 0.8)
-        explanation = "Audio exhibits high consistency in spectral features, uniform energy distribution, and reduced natural variation typical of AI-generated speech."
-    else:
-        classification = "HUMAN"
-        confidence = min(0.95, 0.5 + (1 - ai_score) * 0.8)
-        explanation = "Audio demonstrates natural human speech patterns with organic variations in pitch, energy, and spectral characteristics."
-    
-    return classification, confidence, explanation
-
-@app.get("/")
-async def root():
-    """Root endpoint"""
-    return {
-        "status": "online",
-        "message": "AI Voice Detection API",
-        "version": "1.0.0",
-        "supported_languages": ["tamil", "english", "hindi", "malayalam", "telugu"],
-        "endpoints": {
-            "detect": "/detect",
-            "health": "/health"
-        }
-    }
-
-@app.get("/health")
-async def health():
-    """Health check"""
-    return {
-        "status": "healthy",
-        "service": "ai-voice-detection",
-        "version": "1.0.0"
-    }
-
-@app.post("/detect", response_model=VoiceDetectionResponse)
-async def detect_voice(
-    request: VoiceDetectionRequest,
-    authorization: Optional[str] = Header(None)
-):
-    """
-    Detect if voice is AI-generated or human
-    
-    Args:
-        audio_base64: Base64-encoded MP3 audio
-        language: One of [tamil, english, hindi, malayalam, telugu]
-    
-    Returns:
-        JSON with classification, confidence, language, explanation
-    """
-    
-    # Validate API key
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header required")
-    
-    if authorization != f"Bearer {API_KEY}":
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    
-    # Validate language
-    supported_languages = ["tamil", "english", "hindi", "malayalam", "telugu"]
-    language = request.language.lower() if request.language else "english"
-    
-    if language not in supported_languages:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported language. Must be one of: {', '.join(supported_languages)}"
-        )
-    
-    try:
-        # Decode base64
-        try:
-            audio_bytes = base64.b64decode(request.audio_base64)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid base64 encoding")
-        
-        if len(audio_bytes) == 0:
-            raise HTTPException(status_code=400, detail="Empty audio data")
-        
-        # Load audio
-        try:
-            import librosa
-            audio_data, sample_rate = librosa.load(
-                io.BytesIO(audio_bytes),
-                sr=22050,
-                mono=True
-            )
-        except Exception as e:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Failed to load audio. Ensure it's a valid MP3 file. Error: {str(e)}"
-            )
-        
-        # Extract features
-        features = extract_audio_features(audio_data, sample_rate)
-        
-        # Detect
-        classification, confidence, explanation = detect_ai_voice(features)
-        
-        return VoiceDetectionResponse(
-            classification=classification,
-            confidence=round(confidence, 2),
-            language=language,
-            explanation=explanation
-        )
-        
-    except HTTPException:
+        print(f"Error extracting features: {str(e)}")
         raise
+
+def classify_audio_heuristic(features):
+    """
+    Heuristic-based classification (no ML model needed)
+    AI voices typically have:
+    - More consistent spectral features (lower std)
+    - More uniform zero-crossing rate
+    - More constant energy levels
+    """
+    
+    # Calculate consistency scores
+    spectral_consistency = features.get('spectral_centroid_std', 1000) + features.get('spectral_rolloff_std', 1000)
+    zcr_consistency = features.get('zcr_std', 1)
+    energy_consistency = features.get('rms_std', 1)
+    
+    # Scoring system
+    ai_score = 0
+    human_score = 0
+    
+    # Check spectral consistency (AI voices are more consistent)
+    if spectral_consistency < 1000:  # Very consistent
+        ai_score += 2
+    elif spectral_consistency > 2000:  # Natural variation
+        human_score += 2
+    else:
+        ai_score += 1
+        human_score += 1
+    
+    # Check zero-crossing rate consistency
+    if zcr_consistency < 0.02:  # Very uniform
+        ai_score += 2
+    elif zcr_consistency > 0.04:  # Natural variation
+        human_score += 2
+    else:
+        ai_score += 1
+        human_score += 1
+    
+    # Check energy consistency
+    if energy_consistency < 0.03:  # Constant energy
+        ai_score += 2
+    elif energy_consistency > 0.08:  # Natural variation
+        human_score += 2
+    else:
+        ai_score += 1
+        human_score += 1
+    
+    # Calculate confidence
+    total_score = ai_score + human_score
+    if ai_score > human_score:
+        prediction = 'AI_GENERATED'
+        confidence = ai_score / total_score
+    else:
+        prediction = 'HUMAN'
+        confidence = human_score / total_score
+    
+    # Ensure confidence is reasonable (between 0.55 and 0.95)
+    confidence = max(0.55, min(0.95, confidence))
+    
+    return prediction, confidence
+
+def generate_explanation(features, prediction):
+    """Generate human-readable explanation"""
+    explanations = []
+    
+    spectral_std = features.get('spectral_centroid_std', 0)
+    zcr_std = features.get('zcr_std', 0)
+    rms_std = features.get('rms_std', 0)
+    
+    if prediction == 'AI_GENERATED':
+        if spectral_std < 500:
+            explanations.append("Highly consistent spectral characteristics indicate synthetic generation")
+        if zcr_std < 0.02:
+            explanations.append("Uniform zero-crossing rate pattern typical of AI voices")
+        if rms_std < 0.05:
+            explanations.append("Constant energy levels suggest automated generation")
+        
+        if not explanations:
+            explanations.append("Audio patterns and consistency metrics indicate AI-generated speech")
+    else:
+        if spectral_std > 700:
+            explanations.append("Natural spectral variation detected in voice characteristics")
+        if zcr_std > 0.03:
+            explanations.append("Human-like voice modulation and breathing patterns present")
+        if rms_std > 0.08:
+            explanations.append("Natural energy fluctuations typical of human speech")
+        
+        if not explanations:
+            explanations.append("Audio patterns show natural human speech characteristics")
+    
+    return "; ".join(explanations) if explanations else "Analysis based on audio feature patterns"
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "message": "AI Voice Detection API is running",
+        "version": "1.0"
+    }), 200
+
+@app.route('/detect', methods=['POST'])
+def detect_voice():
+    """Main detection endpoint"""
+    try:
+        # Validate API Key
+        auth_header = request.headers.get('Authorization') or request.headers.get('X-API-Key')
+        if not auth_header or auth_header != API_KEY:
+            return jsonify({
+                "error": "Unauthorized",
+                "message": "Invalid or missing API key"
+            }), 401
+        
+        # Get request data
+        data = request.get_json()
+        
+        if not data or 'audio' not in data:
+            return jsonify({
+                "error": "Bad Request",
+                "message": "Missing 'audio' field in request body"
+            }), 400
+        
+        audio_base64 = data['audio']
+        
+        # Decode base64 audio
+        try:
+            audio_bytes = base64.b64decode(audio_base64)
+        except Exception as e:
+            return jsonify({
+                "error": "Bad Request",
+                "message": "Invalid base64 encoding"
+            }), 400
+        
+        # Save to temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as temp_audio:
+            temp_audio.write(audio_bytes)
+            temp_audio_path = temp_audio.name
+        
+        try:
+            # Extract features
+            features = extract_features(temp_audio_path)
+            
+            # Classify using heuristics (no ML model needed)
+            prediction, confidence = classify_audio_heuristic(features)
+            
+            # Generate explanation
+            explanation = generate_explanation(features, prediction)
+            
+            # Prepare response
+            response = {
+                "classification": prediction,
+                "confidence": round(confidence, 2),
+                "explanation": explanation,
+                "language_support": ["Tamil", "English", "Hindi", "Malayalam", "Telugu"],
+                "status": "success"
+            }
+            
+            return jsonify(response), 200
+        
+        finally:
+            # Clean up temporary file
+            if os.path.exists(temp_audio_path):
+                os.remove(temp_audio_path)
+    
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Internal server error: {str(e)}"
-        )
+        print(f"Error processing request: {str(e)}")
+        print(traceback.format_exc())
+        return jsonify({
+            "error": "Internal Server Error",
+            "message": str(e)
+        }), 500
 
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    """Global exception handler"""
-    return {
-        "error": "Internal server error",
-        "detail": str(exc),
-        "status_code": 500
-    }
+@app.route('/', methods=['GET'])
+def home():
+    """Root endpoint"""
+    return jsonify({
+        "message": "AI Voice Detection API",
+        "version": "1.0",
+        "endpoints": {
+            "/health": "GET - Health check",
+            "/detect": "POST - Detect AI-generated voice"
+        },
+        "authentication": "Required - Use Authorization or X-API-Key header",
+        "supported_languages": ["Tamil", "English", "Hindi", "Malayalam", "Telugu"]
+    }), 200
 
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=port,
-        log_level="info"
-    )
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
